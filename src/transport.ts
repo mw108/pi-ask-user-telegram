@@ -2,14 +2,14 @@ import { randomBytes } from "node:crypto";
 import type { Config } from "./config.js";
 import { TelegramClient, TelegramError } from "./client.js";
 
-export type Response = { kind: "selection"; selections: string[]; comment?: string } | { kind: "freeform"; text: string };
-export type Option = { title: string; description?: string };
-export type Question = { question: string; context?: string; options: Option[]; allowMultiple: boolean; allowFreeform: boolean };
+export type Response = { kind: "selection"; selections: string[]; selectionIds?: string[]; comment?: string } | { kind: "freeform"; text: string };
+export type Option = { id?: string; title: string; description?: string };
+export type Question = { title?: string; question: string; context?: string; options: Option[]; allowMultiple: boolean; allowFreeform: boolean; details?: string; listOptions?: boolean; rejectOnFailure?: boolean };
 type Answer = Response | "skip" | null;
 type Message = { message_id: number; chat: { id: number | string; type?: string }; from?: { id: number | string }; text?: string; reply_to_message?: { message_id: number } };
 type Callback = { id: string; from: { id: number | string }; message?: Message; data?: string };
 type Update = { update_id: number; message?: Message; callback_query?: Callback };
-type Pending = { id: string; callId: string; q: Question; comment: boolean; skip: boolean; messageId?: number; text: string; phase: "select" | "text" | "comment"; selections: Set<number>; finish: (value: Answer, status: string) => void; fail: (message: string) => void; edit: Promise<void> };
+type Pending = { id: string; callId: string; q: Question; comment: boolean; skip: boolean; messageId?: number; text: string; phase: "select" | "text" | "comment"; selections: Set<number>; detailsViewed: boolean; finish: (value: Answer, status: string) => void; fail: (message: string) => void; edit: Promise<void> };
 
 export class Transport {
   private pending = new Map<string, Pending>();
@@ -44,7 +44,8 @@ export class Transport {
     this.fatal = reason;
     this.connected = false;
     this.stop.abort();
-    for (const p of [...this.pending.values()]) p.finish(null, "cancelled");
+    for (const p of [...this.pending.values()])
+      p.q.rejectOnFailure ? p.fail(reason) : p.finish(null, "cancelled");
     return reason;
   }
   private async poll() {
@@ -74,10 +75,14 @@ export class Transport {
   }
   private keyboard(p: Pending) {
     const rows: { text: string; callback_data: string }[][] = [];
+    if (p.q.details)
+      rows.push([{ text: p.detailsViewed ? "View details again" : "View details", callback_data: `${p.id}:details` }]);
     if (p.phase === "select") {
-      p.q.options.forEach((o, i) => rows.push([{ text: `${p.q.allowMultiple ? (p.selections.has(i) ? "✓ " : "○ ") : ""}${o.title}`, callback_data: `${p.id}:o${i}` }]));
-      if (p.q.allowMultiple) rows.push([{ text: "Confirm selection", callback_data: `${p.id}:confirm` }]);
-      if (p.q.allowFreeform) rows.push([{ text: "Type custom response", callback_data: `${p.id}:text` }]);
+      if (!p.q.details || p.detailsViewed) {
+        p.q.options.forEach((o, i) => rows.push([{ text: `${p.q.allowMultiple ? (p.selections.has(i) ? "✓ " : "○ ") : ""}${o.title}`, callback_data: `${p.id}:o${i}` }]));
+        if (p.q.allowMultiple) rows.push([{ text: "Confirm selection", callback_data: `${p.id}:confirm` }]);
+        if (p.q.allowFreeform) rows.push([{ text: "Type custom response", callback_data: `${p.id}:text` }]);
+      }
     }
     if (p.phase === "comment") rows.push([{ text: "Continue without comment", callback_data: `${p.id}:nocomment` }]);
     if (p.skip) rows.push([{ text: "Skip question", callback_data: `${p.id}:skip` }]);
@@ -86,8 +91,31 @@ export class Transport {
   }
   private message(p: Pending, project: string) {
     const q = p.q;
-    const lines = ["Pi — User Input Required", ...(project ? [`Project: ${project}`] : []), "", q.question, ...(q.context ? ["", `Context:\n${q.context}`] : []), ...(q.options.length ? ["", ...q.options.map((o, i) => `${i + 1}. ${o.title}${o.description ? ` — ${o.description}` : ""}`)] : []), "", q.options.length ? "Choose below. Reply to this message when text is requested." : "Reply to this message with your answer."];
+    const lines = [q.title ? `Pi-Team — ${q.title}` : "Pi — User Input Required", ...(project ? [`Project: ${project}`] : []), "", q.question, ...(q.context ? ["", `Context:\n${q.context}`] : []), ...((q.listOptions ?? true) && q.options.length ? ["", ...q.options.map((o, i) => `${i + 1}. ${o.title}${o.description ? ` — ${o.description}` : ""}`)] : []), ...(q.details ? ["", "Review the complete details before choosing a decision."] : []), "", q.options.length ? "Choose below. Reply to this message when text is requested." : "Reply to this message with your answer."];
     return lines.join("\n");
+  }
+  private splitMessage(text: string) {
+    const chunks: string[] = [];
+    let rest = text;
+    while (rest.length > 4000) {
+      let cut = rest.lastIndexOf("\n", 4000);
+      if (cut < 1024) cut = 4000;
+      chunks.push(rest.slice(0, cut));
+      rest = rest.slice(cut).replace(/^\n/, "");
+    }
+    if (rest) chunks.push(rest);
+    return chunks;
+  }
+  private async showDetails(p: Pending) {
+    if (!p.q.details) return;
+    const chunks = this.splitMessage(p.q.details);
+    for (let index = 0; index < chunks.length; index++)
+      await this.api.call("sendMessage", {
+        chat_id: this.config.chat,
+        text: chunks.length === 1 ? chunks[index] : `Details ${index + 1}/${chunks.length}\n\n${chunks[index]}`,
+      }, this.stop.signal);
+    p.detailsViewed = true;
+    this.edit(p);
   }
   private edit(p: Pending, status?: string, answer?: Answer) {
     if (p.messageId === undefined) return;
@@ -118,13 +146,13 @@ export class Transport {
     const id = randomBytes(12).toString("base64url");
     return new Promise<Answer>((resolve, reject) => {
       let settled = false; let finalStatus = "cancelled"; let finalAnswer: Answer = null;
-      const p: Pending = { id, callId, q, comment, skip, text: "", phase: q.options.length ? "select" : "text", selections: new Set(), edit: Promise.resolve(), fail: message => {
+      const p: Pending = { id, callId, q, comment, skip, text: "", phase: q.options.length ? "select" : "text", selections: new Set(), detailsViewed: false, edit: Promise.resolve(), fail: message => {
         if (settled) return; settled = true; clearTimeout(timer); signal.removeEventListener("abort", aborted); this.pending.delete(id); this.edit(p, "cancelled"); reject(new Error(message));
       }, finish: (answer, status) => {
         if (settled) return; settled = true; finalStatus = status; finalAnswer = answer; clearTimeout(timer); signal.removeEventListener("abort", aborted); this.pending.delete(id); this.edit(p, status, answer); resolve(answer);
       } };
       const aborted = () => p.finish(null, "cancelled");
-      const timer = setTimeout(() => p.finish(null, "expired"), Math.max(1, timeoutMs));
+      const timer = timeoutMs > 0 ? setTimeout(() => p.finish(null, "expired"), Math.max(1, timeoutMs)) : undefined;
       this.pending.set(id, p); signal.addEventListener("abort", aborted, { once: true });
       const text = p.text = this.message(p, project);
       if (text.length > 4096 || q.options.some(o => o.title.length > 100) || q.options.length > 90) {
@@ -151,7 +179,9 @@ export class Transport {
       if (action === "cancel") { p.finish(null, "cancelled"); return; }
       if (action === "skip" && p.skip) { p.finish("skip", "skipped"); return; }
       if (action === "nocomment" && p.phase === "comment") { p.finish({ kind: "selection", selections: this.selected(p) }, "answered"); return; }
+      if (action === "details" && p.q.details) { try { await this.showDetails(p); } catch { p.fail("Could not deliver complete Telegram interaction details; no decision was accepted."); } return; }
       if (p.phase !== "select") return;
+      if (p.q.details && !p.detailsViewed) return;
       if (action === "text" && p.q.allowFreeform) { p.phase = "text"; this.edit(p); return; }
       if (/^o\d+$/.test(action)) {
         const i = Number(action.slice(1)); if (!Number.isSafeInteger(i) || i >= p.q.options.length) return;
@@ -165,13 +195,15 @@ export class Transport {
     if (!m || String(m.chat.id) !== this.config.chat || m.chat.type !== "private" || String(m.from?.id) !== this.config.user || !m.reply_to_message || typeof m.text !== "string") return;
     const p = [...this.pending.values()].find(item => item.messageId === m.reply_to_message?.message_id);
     if (!p || p.phase === "select") return;
+    if (p.q.details && !p.detailsViewed) return;
     const text = m.text.trim();
     if (p.phase === "comment") { const response: Response = { kind: "selection", selections: this.selected(p), ...(text ? { comment: text } : {}) }; p.finish(response, "answered"); }
     else if (text) p.finish({ kind: "freeform", text }, "answered");
   }
   private selected(p: Pending) { return p.q.options.filter((_, i) => p.selections.has(i)).map(o => o.title); }
+  private selectedIds(p: Pending) { return p.q.options.filter((_, i) => p.selections.has(i)).map(o => o.id).filter((id): id is string => typeof id === "string"); }
   private selectedOrComment(p: Pending) {
-    if (p.comment) { p.phase = "comment"; this.edit(p); } else p.finish({ kind: "selection", selections: this.selected(p) }, "answered");
+    if (p.comment) { p.phase = "comment"; this.edit(p); } else { const ids = this.selectedIds(p); p.finish({ kind: "selection", selections: this.selected(p), ...(ids.length ? { selectionIds: ids } : {}) }, "answered"); }
   }
   async dispose() { this.isDisposed = true; this.stop.abort(); this.connected = false; for (const p of [...this.pending.values()]) p.finish(null, "cancelled"); await this.loop; }
 }

@@ -6,6 +6,10 @@ import { definition } from "./schema.js";
 import { Transport } from "./transport.js";
 import { acquireLock } from "./lock.js";
 import { TransportLifecycle } from "./lifecycle.js";
+import {
+  createTelegramInteractionService,
+  registerTelegramInteractionService,
+} from "./service.js";
 
 export default function extension(pi: ExtensionAPI) {
   let config: Config | undefined; let startupError: string | undefined;
@@ -16,6 +20,11 @@ export default function extension(pi: ExtensionAPI) {
     config = nextConfig;
     return release;
   }, () => new Transport(config!), reason => notifyFailure?.(reason));
+  const interactionService = createTelegramInteractionService(
+    lifecycle,
+    () => config,
+  );
+  registerTelegramInteractionService(pi, interactionService);
   pi.on("session_start", async (_event, ctx) => {
     notifyFailure = reason => ctx.ui.notify(`Telegram ask_user: ${reason}`, "error");
     try { await lifecycle.start(); startupError = undefined; }

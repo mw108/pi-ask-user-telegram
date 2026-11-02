@@ -7,6 +7,7 @@ import { Transport, type Question } from "../src/transport.js";
 import { executeAsk } from "../src/ask.js";
 import { acquireLock } from "../src/lock.js";
 import { randomUUID } from "node:crypto";
+import { createTelegramInteractionService } from "../src/service.js";
 
 const config = { token: "secret", chat: "123", user: "123", timeout: 2, pollTimeout: 1 };
 type Update = Record<string, unknown>;
@@ -177,4 +178,131 @@ test("shutdown aborts a pending send and returns the existing cancellation resul
   const t = new Transport(config, api as unknown as TelegramClient); t.start();
   const result = executeAsk(t, "a", { question: "Pending" }, undefined, "", events, 2); await tick(); await t.dispose();
   assert.equal(sendAborted, true); assert.equal((await result).content[0].text, "User cancelled the question");
+});
+
+test("shared interaction service returns internal option ids after complete details are delivered", async () => {
+  const { api, t } = setup();
+  const lifecycle = {
+    state: "RUNNING" as const,
+    get transport() { return t; },
+  };
+  const service = createTelegramInteractionService(lifecycle, () => config);
+  const result = service.request({
+    id: "workflow:approval:1",
+    title: "Command approval",
+    message: "Approve the exact command?",
+    project: "project",
+    options: [
+      { id: "allow_once", label: "Allow once" },
+      { id: "deny", label: "Deny" },
+    ],
+    allowText: true,
+    details: "Complete approval details\n" + "D".repeat(9000),
+    timeoutMs: 1000,
+  });
+  await tick();
+  const sent = api.calls.find(x => x.method === "sendMessage")!;
+  const detailData = sent.body.reply_markup.inline_keyboard[0][0].callback_data;
+  const requestId = detailData.split(":")[0];
+  api.push({
+    update_id: 1,
+    callback_query: {
+      id: "details",
+      from: { id: 123 },
+      message: { message_id: 100, chat: { id: 123, type: "private" } },
+      data: `${requestId}:details`,
+    },
+  });
+  await tick();
+  const detailMessages = api.calls.filter(
+    x => x.method === "sendMessage" && x.body.reply_markup === undefined,
+  );
+  assert.ok(detailMessages.length >= 3);
+  assert.ok(detailMessages.every(x => x.body.text.length <= 4096));
+  api.push({
+    update_id: 2,
+    callback_query: {
+      id: "decision",
+      from: { id: 123 },
+      message: { message_id: 100, chat: { id: 123, type: "private" } },
+      data: `${requestId}:o0`,
+    },
+  });
+  assert.deepEqual(await result, {
+    requestId: "workflow:approval:1",
+    selectedOptionIds: ["allow_once"],
+    cancelled: false,
+  });
+  await t.dispose();
+});
+
+test("shared interaction service fails closed when complete details cannot be sent", async () => {
+  const { api, t } = setup();
+  const original = api.call.bind(api);
+  api.call = async <T>(method: string, body: any, signal?: AbortSignal) => {
+    if (method === "sendMessage" && body.reply_markup === undefined)
+      throw new TelegramError(500);
+    return original<T>(method, body, signal);
+  };
+  const service = createTelegramInteractionService(
+    { state: "RUNNING", get transport() { return t; } },
+    () => config,
+  );
+  const result = service.request({
+    id: "approval",
+    title: "Approval",
+    message: "Review",
+    options: [{ id: "allow", label: "Allow" }],
+    details: "Complete details",
+  });
+  await tick();
+  const sent = api.calls.find(x => x.method === "sendMessage")!;
+  const data = sent.body.reply_markup.inline_keyboard[0][0].callback_data;
+  api.push({
+    update_id: 1,
+    callback_query: {
+      id: "details",
+      from: { id: 123 },
+      message: { message_id: 100, chat: { id: 123, type: "private" } },
+      data,
+    },
+  });
+  await assert.rejects(result, /complete Telegram interaction details/);
+  await t.dispose();
+});
+
+test("shared interaction service paginates long free-text questions before accepting a reply", async () => {
+  const { api, t } = setup();
+  const service = createTelegramInteractionService(
+    { state: "RUNNING", get transport() { return t; } },
+    () => config,
+  );
+  const result = service.request({
+    id: "long-question",
+    title: "Clarification",
+    message: "Q".repeat(9000),
+    allowText: true,
+  });
+  await tick();
+  const sent = api.calls.find(x => x.method === "sendMessage")!;
+  assert.match(sent.body.text, /Summary shortened/);
+  const data = sent.body.reply_markup.inline_keyboard[0][0].callback_data;
+  api.push({
+    update_id: 1,
+    callback_query: {
+      id: "details",
+      from: { id: 123 },
+      message: { message_id: 100, chat: { id: 123, type: "private" } },
+      data,
+    },
+  });
+  await tick();
+  api.push(reply(100, "complete answer", 123, 123, 2));
+  assert.deepEqual(await result, {
+    requestId: "long-question",
+    selectedOptionIds: [],
+    text: "complete answer",
+    cancelled: false,
+  });
+  await t.dispose();
 });

@@ -56,7 +56,7 @@ test("Pi session events start one poller and release the lock on repeated shutdo
     });
   }) as typeof fetch;
   const handlers = new Map<string, (...args: any[]) => Promise<void>>();
-  const pi = { on: (name: string, handler: (...args: any[]) => Promise<void>) => handlers.set(name, handler), registerCommand() {}, registerTool() {}, events: { emit() {} } };
+  const pi = { on: (name: string, handler: (...args: any[]) => Promise<void>) => handlers.set(name, handler), registerCommand() {}, registerTool() {}, events: { emit() {}, on() { return () => {}; } } };
   const ctx = { ui: { notify() {} } };
   try {
     extension(pi as unknown as ExtensionAPI);
@@ -163,7 +163,7 @@ for (const code of [401, 409]) test(`HTTP ${code} cancels pending work, releases
     return new Response(JSON.stringify({ ok: true, result: url.endsWith("/sendMessage") ? { message_id: 100 } : true }), { status: 200 });
   }) as typeof fetch;
   const handlers = new Map<string, (...args: any[]) => Promise<void>>(); let tool: any; let command: any;
-  const pi = { on: (name: string, handler: (...args: any[]) => Promise<void>) => handlers.set(name, handler), registerCommand(_name: string, value: unknown) { command = value; }, registerTool(value: unknown) { tool = value; }, events: { emit() {} } };
+  const pi = { on: (name: string, handler: (...args: any[]) => Promise<void>) => handlers.set(name, handler), registerCommand(_name: string, value: unknown) { command = value; }, registerTool(value: unknown) { tool = value; }, events: { emit() {}, on() { return () => {}; } } };
   const ctx = { cwd: "G:\\Projects\\example", ui: { notify(message: string) { notifications.push(message); } } };
   try {
     extension(pi as unknown as ExtensionAPI); const start = handlers.get("session_start")!; const stop = handlers.get("session_shutdown")!;
