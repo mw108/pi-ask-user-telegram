@@ -10,9 +10,11 @@ type Message = { message_id: number; chat: { id: number | string; type?: string 
 type Callback = { id: string; from: { id: number | string }; message?: Message; data?: string };
 type Update = { update_id: number; message?: Message; callback_query?: Callback };
 type Pending = { id: string; callId: string; q: Question; comment: boolean; skip: boolean; messageId?: number; text: string; phase: "select" | "text" | "comment"; selections: Set<number>; detailsViewed: boolean; finish: (value: Answer, status: string) => void; fail: (message: string) => void; edit: Promise<void> };
+type NotificationAction = { messageId: number; actionId: string; expiresAt: number; handler: () => Promise<string>; timer: ReturnType<typeof setTimeout> };
 
 export class Transport {
   private pending = new Map<string, Pending>();
+  private actions = new Map<string, NotificationAction>();
   private stop = new AbortController();
   private offset = 0;
   private loop?: Promise<string | undefined>;
@@ -24,6 +26,22 @@ export class Transport {
   get failure() { return this.fatal; }
   get disposed() { return this.isDisposed; }
   get completion() { return this.loop; }
+  /** Best-effort, non-interactive notification on the lifecycle-owned client. */
+  async notify(text: string): Promise<void> {
+    if (this.fatal || this.stop.signal.aborted) throw new Error("Telegram transport unavailable");
+    if (!text.trim() || text.length > 4096) throw new Error("Invalid Telegram notification length");
+    await this.api.call("sendMessage", { chat_id: this.config.chat, text }, this.stop.signal);
+  }
+  async notifyAction(text: string, label: string, actionId: string, expiresAt: number, handler: () => Promise<string>): Promise<void> {
+    if (this.fatal || this.stop.signal.aborted) throw new Error("Telegram transport unavailable");
+    if (!text.trim() || text.length > 4096 || !label.trim() || label.length > 100 || !actionId.trim() || !Number.isFinite(expiresAt) || expiresAt <= Date.now()) throw new Error("Invalid notification action");
+    const id = randomBytes(12).toString("base64url");
+    const message = await this.api.call<{ message_id: number }>("sendMessage", { chat_id: this.config.chat, text, reply_markup: { inline_keyboard: [[{ text: label, callback_data: `n${id}:run` }]] } }, this.stop.signal);
+    if (this.stop.signal.aborted) return;
+    const timer = setTimeout(() => this.actions.delete(id), Math.min(2147483647, Math.max(1, expiresAt - Date.now())));
+    timer.unref();
+    this.actions.set(id, { messageId: message.message_id, actionId, expiresAt, handler, timer });
+  }
   start() {
     if (this.loop) return;
     this.loop = this.poll().then(
@@ -42,6 +60,8 @@ export class Transport {
   }
   private terminate(reason: string): string {
     this.fatal = reason;
+    for (const action of this.actions.values()) clearTimeout(action.timer);
+    this.actions.clear();
     this.connected = false;
     this.stop.abort();
     for (const p of [...this.pending.values()])
@@ -171,6 +191,25 @@ export class Transport {
     const cb = update.callback_query;
     if (cb) {
       const [id, action] = (cb.data ?? "").split(":");
+      if (id?.startsWith("n") && id.length === 17) {
+        const key = id.slice(1);
+        const notification = this.actions.get(key);
+        const authorized = String(cb.from.id) === this.config.user && String(cb.message?.chat.id) === this.config.chat && cb.message?.chat.type === "private" && notification?.messageId === cb.message?.message_id;
+        void this.api.call("answerCallbackQuery", { callback_query_id: cb.id }, this.stop.signal).catch(() => {});
+        if (!authorized || !notification || action !== "run") return;
+        this.actions.delete(key);
+        clearTimeout(notification.timer);
+        void (async () => {
+          let text = "Pi-Team — Retry unavailable\n\nThe action expired. Use /team-status to review recovery.";
+          if (notification.expiresAt > Date.now()) {
+            try { text = await notification.handler(); }
+            catch { text = "Pi-Team — Retry unavailable\n\nThe action failed. Use /team-status to review recovery."; }
+          }
+          try { await this.api.call("editMessageText", { chat_id: this.config.chat, message_id: notification.messageId, text: text.slice(0, 4000), reply_markup: { inline_keyboard: [] } }, this.stop.signal); }
+          catch { await this.api.call("editMessageReplyMarkup", { chat_id: this.config.chat, message_id: notification.messageId, reply_markup: { inline_keyboard: [] } }, this.stop.signal).catch(() => {}); }
+        })();
+        return;
+      }
       const p = this.pending.get(id ?? "");
       const authorized = String(cb.from.id) === this.config.user && String(cb.message?.chat.id) === this.config.chat && cb.message?.chat.type === "private" && p?.messageId === cb.message?.message_id;
       // Acknowledge even invalid/stale callbacks without exposing request state.
@@ -205,5 +244,5 @@ export class Transport {
   private selectedOrComment(p: Pending) {
     if (p.comment) { p.phase = "comment"; this.edit(p); } else { const ids = this.selectedIds(p); p.finish({ kind: "selection", selections: this.selected(p), ...(ids.length ? { selectionIds: ids } : {}) }, "answered"); }
   }
-  async dispose() { this.isDisposed = true; this.stop.abort(); this.connected = false; for (const p of [...this.pending.values()]) p.finish(null, "cancelled"); await this.loop; }
+  async dispose() { this.isDisposed = true; this.stop.abort(); this.connected = false; for (const action of this.actions.values()) clearTimeout(action.timer); this.actions.clear(); for (const p of [...this.pending.values()]) p.finish(null, "cancelled"); await this.loop; }
 }

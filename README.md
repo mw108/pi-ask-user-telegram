@@ -72,3 +72,14 @@ Reload or graceful shutdown cancels in-memory questions and attempts to disable 
 ## Development
 
 `npm run build`, `npm run test`, and `npm run check` type-check and run mocked tests without Telegram credentials or real messages. `build` is a TypeScript check because Pi loads the TypeScript extension directly. The reference schema and description in `src/schema.ts` are derived from `pi-ask-user` 0.17.1 under its MIT license; see LICENSE.
+
+## Notification service
+
+The `pi-ask-user-telegram:notification-service:v1` event-bus capability sends
+non-interactive notifications through the existing lifecycle-owned Telegram
+client. It does not wait for a response or create another polling loop. The
+separately versioned `notification-service:v2` supports one-shot actions bound
+to the authorized private chat, sender and message. Actions expire in memory
+and are discarded on shutdown; old buttons cannot invoke a handler after a
+restart. Pi-Team does not yet connect retries to this capability. The existing
+`interaction-service:v1` question contract is unchanged.

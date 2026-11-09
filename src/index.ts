@@ -6,6 +6,7 @@ import { definition } from "./schema.js";
 import { Transport } from "./transport.js";
 import { acquireLock } from "./lock.js";
 import { TransportLifecycle } from "./lifecycle.js";
+import { registerNotificationService } from "./notification-service.js";
 import {
   createTelegramInteractionService,
   registerTelegramInteractionService,
@@ -25,6 +26,7 @@ export default function extension(pi: ExtensionAPI) {
     () => config,
   );
   registerTelegramInteractionService(pi, interactionService);
+  registerNotificationService(pi, lifecycle);
   pi.on("session_start", async (_event, ctx) => {
     notifyFailure = reason => ctx.ui.notify(`Telegram ask_user: ${reason}`, "error");
     try { await lifecycle.start(); startupError = undefined; }

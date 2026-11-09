@@ -30,6 +30,34 @@ class FakeApi {
 const tick = () => new Promise(resolve => setTimeout(resolve, 10));
 const q: Question = { question: "Which?", options: [{ title: "One" }, { title: "Zwei", description: "Detail" }], allowMultiple: false, allowFreeform: true };
 const events = { emit() {} };
+test("notification actions authenticate and consume callbacks once", async () => {
+  const { api, t } = setup(); let calls = 0;
+  await t.notifyAction("Blocked", "Retry", "action", Date.now() + 60000, async () => { calls++; return "Retry accepted"; });
+  api.push(button(api, 100, 0, 999, 123, 1));
+  await tick(); assert.equal(calls, 0);
+  api.push(button(api, 100, 0, 123, 123, 2));
+  api.push(button(api, 100, 0, 123, 123, 3));
+  await tick(); assert.equal(calls, 1);
+  assert.ok(api.calls.some(call => call.method === "editMessageText" && call.body.reply_markup.inline_keyboard.length === 0));
+  await t.dispose();
+});
+test("expired and shutdown notification actions cannot invoke their handler", async () => {
+  const { api, t } = setup(); let calls = 0;
+  await t.notifyAction("Blocked", "Retry", "action", Date.now() + 20, async () => { calls++; return "accepted"; });
+  await new Promise(resolve => setTimeout(resolve, 40));
+  api.push(button(api, 100, 0)); await tick(); assert.equal(calls, 0);
+  await t.dispose();
+  await assert.rejects(t.notifyAction("Blocked", "Retry", "action", Date.now() + 1000, async () => "accepted"), /unavailable/);
+});
+test("notifications reuse the transport without leaving a pending question", async () => {
+  const { api, t } = setup();
+  await t.notify("Workflow blocked");
+  assert.equal(t.count, 0);
+  assert.equal(api.calls.filter(call => call.method === "sendMessage")[0].body.text, "Workflow blocked");
+  await assert.rejects(t.notify("x".repeat(4097)), /length/);
+  await t.dispose();
+  await assert.rejects(t.notify("after shutdown"), /unavailable/);
+});
 function setup() { const api = new FakeApi(); const t = new Transport(config, api as unknown as TelegramClient); t.start(); return { api, t }; }
 function button(api: FakeApi, msg: number, row: number, from = 123, chat = 123, update = 1) {
   const send = api.calls.filter(x => x.method === "sendMessage")[msg - 100];
